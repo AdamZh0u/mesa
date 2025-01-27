@@ -148,7 +148,7 @@ class Agent:
 
 class AgentSet(CollectionBase[Agent]):
     """A collection of agents within an agent-based model (ABM).
-    
+
     This class extends CollectionBase to provide specialized functionality for managing
     agents, including weak references to allow proper garbage collection.
     """
@@ -168,42 +168,6 @@ class AgentSet(CollectionBase[Agent]):
     def __contains__(self, agent: Agent) -> bool:
         """Check if an agent is in the set."""
         return agent in self._agents
-
-    def shuffle(self, inplace: bool = False) -> AgentSet:
-        """Randomly shuffle the order of agents."""
-        weakrefs = list(self._agents.keyrefs())
-        self.random.shuffle(weakrefs)
-
-        if inplace:
-            self._agents.data = {entry: None for entry in weakrefs}
-            return self
-        else:
-            return AgentSet(
-                (agent for ref in weakrefs if (agent := ref()) is not None),
-                self.random
-            )
-
-    def _update(self, agents: Iterable[Agent]) -> AgentSet:
-        """Update the set with new agents."""
-        self._agents = weakref.WeakKeyDictionary({agent: None for agent in agents})
-        return self
-
-    def add(self, agent: Agent) -> None:
-        """Add an agent to the set."""
-        self._agents[agent] = None
-
-    def discard(self, agent: Agent) -> None:
-        """Remove an agent from the set if present."""
-        with contextlib.suppress(KeyError):
-            del self._agents[agent]
-
-    def remove(self, agent: Agent) -> None:
-        """Remove an agent from the set."""
-        del self._agents[agent]
-
-    def __getitem__(self, item: int | slice) -> Agent | list[Agent]:
-        """Get agent(s) at the specified index or slice."""
-        return list(self._agents.keys())[item]
 
     def select(
         self,
@@ -253,6 +217,19 @@ class AgentSet(CollectionBase[Agent]):
 
         return AgentSet(agents, self.random) if not inplace else self._update(agents)
 
+    def shuffle(self, inplace: bool = False) -> AgentSet:
+        """Randomly shuffle the order of agents."""
+        weakrefs = list(self._agents.keyrefs())
+        self.random.shuffle(weakrefs)
+
+        if inplace:
+            self._agents.data = {entry: None for entry in weakrefs}
+            return self
+        else:
+            return AgentSet(
+                (agent for ref in weakrefs if (agent := ref()) is not None), self.random
+            )
+
     def sort(
         self,
         key: Callable[[Agent], Any] | str,
@@ -279,6 +256,38 @@ class AgentSet(CollectionBase[Agent]):
             if not inplace
             else self._update(sorted_agents)
         )
+
+    def _update(self, agents: Iterable[Agent]) -> AgentSet:
+        """Update the set with new agents."""
+        self._agents = weakref.WeakKeyDictionary({agent: None for agent in agents})
+        return self
+
+    def do(self, method: str | Callable, *args, **kwargs) -> AgentSet:
+        """Invoke a method or function on each agent in the AgentSet.
+
+        Args:
+            method (str, callable): the callable to do on each agent
+
+                                        * in case of str, the name of the method to call on each agent.
+                                        * in case of callable, the function to be called with each agent as first argument
+
+            *args: Variable length argument list passed to the callable being called.
+            **kwargs: Arbitrary keyword arguments passed to the callable being called.
+
+        Returns:
+            AgentSet | list[Any]: The results of the callable calls if return_results is True, otherwise the AgentSet itself.
+        """
+        # we iterate over the actual weakref keys and check if weakref is alive before calling the method
+        if isinstance(method, str):
+            for agentref in self._agents.keyrefs():
+                if (agent := agentref()) is not None:
+                    getattr(agent, method)(*args, **kwargs)
+        else:
+            for agentref in self._agents.keyrefs():
+                if (agent := agentref()) is not None:
+                    method(agent, *args, **kwargs)
+
+        return self
 
     def shuffle_do(self, method: str | Callable, *args, **kwargs) -> AgentSet:
         """Shuffle the agents in the AgentSet and then invoke a method or function on each agent.
@@ -425,6 +434,38 @@ class AgentSet(CollectionBase[Agent]):
             setattr(agent, attr_name, value)
         return self
 
+    def __getitem__(self, item: int | slice) -> Agent | list[Agent]:
+        """Get agent(s) at the specified index or slice."""
+        return list(self._agents.keys())[item]
+
+    def add(self, agent: Agent) -> None:
+        """Add an agent to the set."""
+        self._agents[agent] = None
+
+    def discard(self, agent: Agent) -> None:
+        """Remove an agent from the set if present."""
+        with contextlib.suppress(KeyError):
+            del self._agents[agent]
+
+    def remove(self, agent: Agent) -> None:
+        """Remove an agent from the set."""
+        del self._agents[agent]
+
+    def __getstate__(self):
+        """Return state for pickling.
+
+        Convert WeakKeyDictionary to a regular list of agents for serialization.
+        """
+        return {"agents": list(self._agents.keys()), "random": self.random}
+
+    def __setstate__(self, state):
+        """Set state when unpickling.
+
+        Restore WeakKeyDictionary from the list of agents.
+        """
+        self.random = state["random"]
+        self._update(state["agents"])
+
     def groupby(self, by: Callable | str, result_type: str = "agentset") -> GroupBy:
         """Group agents by the specified attribute or return from the callable.
 
@@ -461,10 +502,6 @@ class AgentSet(CollectionBase[Agent]):
             )
         else:
             return GroupBy(groups)
-
-    # consider adding for performance reasons
-    # for Sequence: __reversed__, index, and count
-    # for MutableSet clear, pop, remove, __ior__, __iand__, __ixor__, and __isub__
 
 
 class GroupBy:
@@ -512,7 +549,7 @@ class GroupBy:
         else:
             return {k: method(v, *args, **kwargs) for k, v in self.groups.items()}
 
-    def do(self, method: Callable | str, *args, **kwargs) -> GroupBy:
+    def do(self, method: str | Callable, *args, **kwargs) -> GroupBy:
         """Apply the specified callable to each group.
 
         Args:
