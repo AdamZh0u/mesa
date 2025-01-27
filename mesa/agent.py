@@ -29,6 +29,8 @@ if TYPE_CHECKING:
     from mesa.model import Model
     from mesa.space import Position
 
+from mesa.collectionbase import CollectionBase
+
 
 class Agent:
     """Base class for a model agent in Mesa.
@@ -144,58 +146,64 @@ class Agent:
         return self.model.rng
 
 
-class AgentSet(MutableSet, Sequence):
-    """A collection class that represents an ordered set of agents within an agent-based model (ABM).
-
-    This class extends both MutableSet and Sequence, providing set-like functionality with order preservation and
-    sequence operations.
-
-    Attributes:
-        model (Model): The ABM model instance to which this AgentSet belongs.
-
-    Notes:
-        The AgentSet maintains weak references to agents, allowing for efficient management of agent lifecycles
-        without preventing garbage collection. It is associated with a specific model instance, enabling
-        interactions with the model's environment and other agents.The implementation uses a WeakKeyDictionary to store agents,
-        which means that agents not referenced elsewhere in the program may be automatically removed from the AgentSet.
-
-    Notes:
-        A `UserWarning` is issued if `random=None`. You can resolve this warning by explicitly
-        passing a random number generator. In most cases, this will be the seeded random number
-        generator in the model. So, you would do `random=self.random` in a `Model` or `Agent` instance.
-
+class AgentSet(CollectionBase[Agent]):
+    """A collection of agents within an agent-based model (ABM).
+    
+    This class extends CollectionBase to provide specialized functionality for managing
+    agents, including weak references to allow proper garbage collection.
     """
 
-    def __init__(self, agents: Iterable[Agent], random: Random | None = None):
-        """Initializes the AgentSet with a collection of agents and a reference to the model.
-
-        Args:
-            agents (Iterable[Agent]): An iterable of Agent objects to be included in the set.
-            random (Random): the random number generator
-        """
-        if random is None:
-            warnings.warn(
-                "Random number generator not specified, this can make models non-reproducible. Please pass a random number generator explicitly",
-                UserWarning,
-                stacklevel=2,
-            )
-            random = (
-                Random()
-            )  # FIXME see issue 1981, how to get the central rng from model
-        self.random = random
+    def _initialize_storage(self, agents: Iterable[Agent]) -> None:
+        """Initialize the weak reference dictionary for storing agents."""
         self._agents = weakref.WeakKeyDictionary({agent: None for agent in agents})
 
     def __len__(self) -> int:
-        """Return the number of agents in the AgentSet."""
+        """Return the number of agents in the set."""
         return len(self._agents)
 
     def __iter__(self) -> Iterator[Agent]:
-        """Provide an iterator over the agents in the AgentSet."""
+        """Provide an iterator over the agents."""
         return self._agents.keys()
 
     def __contains__(self, agent: Agent) -> bool:
-        """Check if an agent is in the AgentSet. Can be used like `agent in agentset`."""
+        """Check if an agent is in the set."""
         return agent in self._agents
+
+    def shuffle(self, inplace: bool = False) -> AgentSet:
+        """Randomly shuffle the order of agents."""
+        weakrefs = list(self._agents.keyrefs())
+        self.random.shuffle(weakrefs)
+
+        if inplace:
+            self._agents.data = {entry: None for entry in weakrefs}
+            return self
+        else:
+            return AgentSet(
+                (agent for ref in weakrefs if (agent := ref()) is not None),
+                self.random
+            )
+
+    def _update(self, agents: Iterable[Agent]) -> AgentSet:
+        """Update the set with new agents."""
+        self._agents = weakref.WeakKeyDictionary({agent: None for agent in agents})
+        return self
+
+    def add(self, agent: Agent) -> None:
+        """Add an agent to the set."""
+        self._agents[agent] = None
+
+    def discard(self, agent: Agent) -> None:
+        """Remove an agent from the set if present."""
+        with contextlib.suppress(KeyError):
+            del self._agents[agent]
+
+    def remove(self, agent: Agent) -> None:
+        """Remove an agent from the set."""
+        del self._agents[agent]
+
+    def __getitem__(self, item: int | slice) -> Agent | list[Agent]:
+        """Get agent(s) at the specified index or slice."""
+        return list(self._agents.keys())[item]
 
     def select(
         self,
@@ -245,30 +253,6 @@ class AgentSet(MutableSet, Sequence):
 
         return AgentSet(agents, self.random) if not inplace else self._update(agents)
 
-    def shuffle(self, inplace: bool = False) -> AgentSet:
-        """Randomly shuffle the order of agents in the AgentSet.
-
-        Args:
-            inplace (bool, optional): If True, shuffles the agents in the current AgentSet; otherwise, returns a new shuffled AgentSet. Defaults to False.
-
-        Returns:
-            AgentSet: A shuffled AgentSet. Returns the current AgentSet if inplace is True.
-
-        Note:
-            Using inplace = True is more performant
-
-        """
-        weakrefs = list(self._agents.keyrefs())
-        self.random.shuffle(weakrefs)
-
-        if inplace:
-            self._agents.data = {entry: None for entry in weakrefs}
-            return self
-        else:
-            return AgentSet(
-                (agent for ref in weakrefs if (agent := ref()) is not None), self.random
-            )
-
     def sort(
         self,
         key: Callable[[Agent], Any] | str,
@@ -295,41 +279,6 @@ class AgentSet(MutableSet, Sequence):
             if not inplace
             else self._update(sorted_agents)
         )
-
-    def _update(self, agents: Iterable[Agent]):
-        """Update the AgentSet with a new set of agents.
-
-        This is a private method primarily used internally by other methods like select, shuffle, and sort.
-        """
-        self._agents = weakref.WeakKeyDictionary({agent: None for agent in agents})
-        return self
-
-    def do(self, method: str | Callable, *args, **kwargs) -> AgentSet:
-        """Invoke a method or function on each agent in the AgentSet.
-
-        Args:
-            method (str, callable): the callable to do on each agent
-
-                                        * in case of str, the name of the method to call on each agent.
-                                        * in case of callable, the function to be called with each agent as first argument
-
-            *args: Variable length argument list passed to the callable being called.
-            **kwargs: Arbitrary keyword arguments passed to the callable being called.
-
-        Returns:
-            AgentSet | list[Any]: The results of the callable calls if return_results is True, otherwise the AgentSet itself.
-        """
-        # we iterate over the actual weakref keys and check if weakref is alive before calling the method
-        if isinstance(method, str):
-            for agentref in self._agents.keyrefs():
-                if (agent := agentref()) is not None:
-                    getattr(agent, method)(*args, **kwargs)
-        else:
-            for agentref in self._agents.keyrefs():
-                if (agent := agentref()) is not None:
-                    method(agent, *args, **kwargs)
-
-        return self
 
     def shuffle_do(self, method: str | Callable, *args, **kwargs) -> AgentSet:
         """Shuffle the agents in the AgentSet and then invoke a method or function on each agent.
@@ -475,72 +424,6 @@ class AgentSet(MutableSet, Sequence):
         for agent in self:
             setattr(agent, attr_name, value)
         return self
-
-    def __getitem__(self, item: int | slice) -> Agent:
-        """Retrieve an agent or a slice of agents from the AgentSet.
-
-        Args:
-            item (int | slice): The index or slice for selecting agents.
-
-        Returns:
-            Agent | list[Agent]: The selected agent or list of agents based on the index or slice provided.
-        """
-        return list(self._agents.keys())[item]
-
-    def add(self, agent: Agent):
-        """Add an agent to the AgentSet.
-
-        Args:
-            agent (Agent): The agent to add to the set.
-
-        Note:
-            This method is an implementation of the abstract method from MutableSet.
-        """
-        self._agents[agent] = None
-
-    def discard(self, agent: Agent):
-        """Remove an agent from the AgentSet if it exists.
-
-        This method does not raise an error if the agent is not present.
-
-        Args:
-            agent (Agent): The agent to remove from the set.
-
-        Note:
-            This method is an implementation of the abstract method from MutableSet.
-        """
-        with contextlib.suppress(KeyError):
-            del self._agents[agent]
-
-    def remove(self, agent: Agent):
-        """Remove an agent from the AgentSet.
-
-        This method raises an error if the agent is not present.
-
-        Args:
-            agent (Agent): The agent to remove from the set.
-
-        Note:
-            This method is an implementation of the abstract method from MutableSet.
-        """
-        del self._agents[agent]
-
-    def __getstate__(self):
-        """Retrieve the state of the AgentSet for serialization.
-
-        Returns:
-            dict: A dictionary representing the state of the AgentSet.
-        """
-        return {"agents": list(self._agents.keys()), "random": self.random}
-
-    def __setstate__(self, state):
-        """Set the state of the AgentSet during deserialization.
-
-        Args:
-            state (dict): A dictionary representing the state to restore.
-        """
-        self.random = state["random"]
-        self._update(state["agents"])
 
     def groupby(self, by: Callable | str, result_type: str = "agentset") -> GroupBy:
         """Group agents by the specified attribute or return from the callable.
